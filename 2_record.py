@@ -5,7 +5,7 @@ Rekam RTSP stream terus-menerus, potong tiap N detik,
 simpan ke folder videos/ untuk diproses 1_detect.py.
 
 Jalankan DUA terminal:
-  Terminal 1: python 2_record.py
+  Terminal 1: python record.py
   Terminal 2: python 1_detect.py --source folder --file videos/
 
 Alur:
@@ -49,6 +49,7 @@ def load_config(path='config.ini'):
         'duration'    : getint('RECORD', 'Duration',      fb=60),
         'keep_files'  : getint('RECORD', 'KeepFiles',     fb=10),
         'reconnect_s' : getint('CAMERA', 'ReconnectDelay', fb=5),
+        'record_fps'  : getint('RECORD', 'RecordFPS',     fb=10),
     }
 
 
@@ -81,17 +82,33 @@ def record_segment(videos_dir, duration, rtsp_url):
     filename = f'rec_{ts}.mp4'
     filepath = str(Path(videos_dir) / filename)
 
+    fps = CFG.get('record_fps', 10)
+
+    # Jika fps < fps kamera asli: re-encode dengan fps rendah
+    # Manfaat: file lebih kecil + 1_detect.py proses lebih sedikit frame
+    # tapi setiap frame tetap resolusi penuh (tidak ada informasi hilang)
+    if fps > 0:
+        video_opts = [
+            '-vf',   f'fps={fps}',       # throttle ke N fps
+            '-c:v',  'libx264',          # re-encode (perlu karena ubah fps)
+            '-preset', 'ultrafast',      # encode secepat mungkin
+            '-crf',  '28',               # kualitas: 18=tinggi, 28=cukup
+        ]
+    else:
+        # fps=0: copy stream langsung tanpa re-encode (paling cepat)
+        video_opts = ['-c:v', 'copy']
+
     cmd = [
         'ffmpeg',
-        '-loglevel',   'error',          # sembunyikan info ffmpeg
-        '-rtsp_transport', 'tcp',        # TCP lebih stabil
-        '-fflags',     'nobuffer',
-        '-flags',      'low_delay',
-        '-i',          rtsp_url,
-        '-t',          str(duration),    # durasi segment
-        '-c:v',        'copy',           # copy tanpa re-encode (hemat CPU)
-        '-an',                           # no audio
-        '-movflags',   '+faststart',
+        '-loglevel',       'error',
+        '-rtsp_transport', 'tcp',
+        '-fflags',         'nobuffer',
+        '-flags',          'low_delay',
+        '-i',              rtsp_url,
+        '-t',              str(duration),
+        *video_opts,
+        '-an',
+        '-movflags', '+faststart',
         '-y',
         filepath,
     ]
@@ -137,6 +154,7 @@ def main():
     print(f"  RTSP     : {CFG['rtsp_url']}")
     print(f"  Simpan ke: {CFG['videos_dir']}")
     print(f"  Durasi   : {CFG['duration']}s per segment")
+    print(f"  FPS      : {CFG['record_fps']} fps (0=copy asli)")
     print(f"  Keep     : {CFG['keep_files']} file terakhir")
     print('=' * 50)
     print('Ctrl+C untuk berhenti\n')

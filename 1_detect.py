@@ -105,10 +105,13 @@ def load_config(path='config.ini'):
         'device_id'       : get('DEVICE', 'DeviceID', fallback='gate-01'),
         'device_location' : get('DEVICE', 'Location', fallback=''),
 
-        # ROI
-        'roi_y'           : getfloat('ROI', 'Y',  fallback=0.55),
+        # ROI BOX (klik 2 titik pojok kiri-atas dan kanan-bawah)
+        'roi_y1'          : getfloat('ROI', 'Y1', fallback=0.45),
+        'roi_y2'          : getfloat('ROI', 'Y2', fallback=0.65),
         'roi_x1'          : getfloat('ROI', 'X1', fallback=0.05),
         'roi_x2'          : getfloat('ROI', 'X2', fallback=0.95),
+        # Backward compat: jika roi_config.json lama pakai 'roi_y'
+        'roi_y'           : getfloat('ROI', 'Y',  fallback=0.55),
 
         # MODEL
         'vehicle_model'   : get('MODEL', 'VehicleModel',     fallback='models/yolov8n.pt'),
@@ -155,68 +158,155 @@ VLABEL   = {2:'Car', 3:'Motorcycle', 5:'Bus', 7:'Truck'}
 CFG      = {}
 
 
-# ─── ROI ──────────────────────────────────────────────────────────────────────
+# ─── ROI BOX ──────────────────────────────────────────────────────────────────
 class ROI:
+    """
+    ROI berbentuk BOX (persegi panjang).
+    Kendaraan dihitung MASUK jika:
+      1. Titik tengah bawah bbox (cx, y2) masuk ke dalam area box
+      2. Arah gerak dari atas ke bawah (prev_y < y2)
+    Lebih toleran dari garis tunggal — motor kecil tetap terdeteksi.
+    """
     def __init__(self, fw, fh):
         self.fw, self.fh = fw, fh
         d = json.load(open(ROI_FILE)) if os.path.exists(ROI_FILE) else {}
-        self.y  = int(d.get('roi_y',  CFG['roi_y'])  * fh)
+
+        # Support format lama (roi_y = garis) dan baru (roi_y1/roi_y2 = box)
+        if 'roi_y1' in d:
+            self.y1 = int(d['roi_y1'] * fh)
+            self.y2 = int(d['roi_y2'] * fh)
+        else:
+            # Konversi dari garis lama: buat box 10% tinggi frame di sekitar garis
+            mid     = d.get('roi_y', CFG['roi_y'])
+            margin  = 0.08
+            self.y1 = int(max(0,   mid - margin) * fh)
+            self.y2 = int(min(1.0, mid + margin) * fh)
+
         self.x1 = int(d.get('roi_x1', CFG['roi_x1']) * fw)
         self.x2 = int(d.get('roi_x2', CFG['roi_x2']) * fw)
 
+        print(f"  ROI Box: ({self.x1},{self.y1}) → ({self.x2},{self.y2})")
+
     def draw(self, frame, cnt_total=0):
-        """Gambar garis ROI + label counter + arah masuk."""
-        # Garis ROI
-        cv2.line(frame, (self.x1, self.y), (self.x2, self.y), (0,255,0), 2)
-        # Label kiri
+        # Box semi-transparan
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (self.x1, self.y1), (self.x2, self.y2),
+                      (0, 255, 0), -1)
+        cv2.addWeighted(overlay, 0.08, frame, 0.92, 0, frame)
+        # Border box
+        cv2.rectangle(frame, (self.x1, self.y1), (self.x2, self.y2),
+                      (0, 255, 0), 2)
+        # Label + counter
         cv2.putText(frame, f'ROI  v MASUK: {cnt_total}',
-                    (self.x1+4, self.y-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
-        # Panah tengah
+                    (self.x1 + 6, self.y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
+        # Panah arah masuk
         mid = (self.x1 + self.x2) // 2
-        cv2.arrowedLine(frame, (mid, self.y-30), (mid, self.y+8),
-                        (0,255,128), 2, tipLength=0.4)
+        cv2.arrowedLine(frame,
+                        (mid, self.y1 - 20),
+                        (mid, self.y1 + 10),
+                        (0, 255, 128), 2, tipLength=0.4)
         return frame
 
-    def crossed_downward(self, prev_y, cur_y):
-        """True hanya jika bergerak atas→bawah (y bertambah) melewati ROI."""
-        return prev_y < self.y <= cur_y
+    def inside(self, cx, cy):
+        """True jika titik (cx,cy) berada di dalam box."""
+        return self.x1 <= cx <= self.x2 and self.y1 <= cy <= self.y2
 
-    def near(self, y, m=35):
-        return abs(y - self.y) < m
+    def crossed_downward(self, prev_y2, cur_y2, cx):
+        """
+        True jika:
+        - Titik tengah bawah bbox (cx, cur_y2) masuk ke dalam box
+        - Arah dari atas ke bawah (prev_y2 < y1 <= cur_y2)
+        - cx berada di antara x1..x2
+        Lebih toleran dari garis — kendaraan tetap terhitung
+        meski hanya sebagian bbox yang masuk area.
+        """
+        in_x     = self.x1 <= cx <= self.x2
+        entering = prev_y2 < self.y1 and cur_y2 >= self.y1
+        return in_x and entering
+
+    def near(self, y, m=0):
+        """True jika y berada di dalam atau dekat box (untuk warna bbox)."""
+        return self.y1 - 20 <= y <= self.y2 + 20
 
 
 def setup_roi(frame):
+    """
+    Setup ROI Box interaktif.
+    Klik pojok kiri-atas → klik pojok kanan-bawah → Enter simpan.
+    Box ini adalah zona deteksi crossing kendaraan MASUK.
+    """
     pts = []
     def cb(e, x, y, f, p):
         if e == cv2.EVENT_LBUTTONDOWN and len(pts) < 2:
             pts.append((x, y))
+            print(f"  Titik {len(pts)}: ({x}, {y})")
+
     cv2.namedWindow('ROI Setup', cv2.WINDOW_NORMAL)
     cv2.setMouseCallback('ROI Setup', cb)
-    print('Klik 2 titik -> Enter/S simpan | R reset | Q batal')
-    print('Kendaraan dari ATAS ke BAWAH garis = MASUK')
+
+    print('\n=== ROI Box Setup ===')
+    print('Klik pojok KIRI-ATAS box  → klik pojok KANAN-BAWAH box')
+    print('Buat box di area yang kendaraan PASTI melewatinya saat masuk')
+    print('Enter/S = simpan | R = reset | Q = batal\n')
+
     h, w = frame.shape[:2]
     while True:
         d = frame.copy()
-        for p in pts:
-            cv2.circle(d, p, 6, (0,0,255), -1)
+
+        # Gambar titik yang sudah diklik
+        for i, p in enumerate(pts):
+            cv2.circle(d, p, 7, (0,0,255), -1)
+            label = 'kiri-atas' if i == 0 else 'kanan-bawah'
+            cv2.putText(d, label, (p[0]+8, p[1]-8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 1)
+
+        # Preview box saat 2 titik sudah diklik
         if len(pts) == 2:
-            cv2.line(d, pts[0], pts[1], (0,255,0), 2)
-        cv2.putText(d, 'ROI Setup - arah masuk: atas ke bawah | Enter=simpan',
-                    (10,26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+            x1 = min(pts[0][0], pts[1][0])
+            y1 = min(pts[0][1], pts[1][1])
+            x2 = max(pts[0][0], pts[1][0])
+            y2 = max(pts[0][1], pts[1][1])
+            # Box semi-transparan
+            overlay = d.copy()
+            cv2.rectangle(overlay, (x1,y1), (x2,y2), (0,255,0), -1)
+            cv2.addWeighted(overlay, 0.2, d, 0.8, 0, d)
+            cv2.rectangle(d, (x1,y1), (x2,y2), (0,255,0), 2)
+            mid = (x1+x2)//2
+            cv2.arrowedLine(d, (mid, y1-20), (mid, y1+10),
+                            (0,255,128), 2, tipLength=0.4)
+            cv2.putText(d, f'Box: ({x1},{y1})-({x2},{y2})',
+                        (x1, y1-12),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        cv2.putText(d,
+            'Klik pojok KIRI-ATAS lalu KANAN-BAWAH | Enter=simpan R=reset Q=batal',
+            (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+
         cv2.imshow('ROI Setup', d)
         k = cv2.waitKey(30) & 0xFF
+
         if k in (13, ord('s')) and len(pts) == 2:
+            x1 = min(pts[0][0], pts[1][0])
+            y1 = min(pts[0][1], pts[1][1])
+            x2 = max(pts[0][0], pts[1][0])
+            y2 = max(pts[0][1], pts[1][1])
             cfg = {
-                'roi_y'  : (pts[0][1]+pts[1][1])/2/h,
-                'roi_x1' : min(pts[0][0],pts[1][0])/w,
-                'roi_x2' : max(pts[0][0],pts[1][0])/w,
+                'roi_y1' : y1 / h,
+                'roi_y2' : y2 / h,
+                'roi_x1' : x1 / w,
+                'roi_x2' : x2 / w,
             }
             json.dump(cfg, open(ROI_FILE,'w'), indent=2)
-            print(f'ROI saved: {cfg}')
+            print(f'ROI Box saved: y1={cfg["roi_y1"]:.3f} y2={cfg["roi_y2"]:.3f} ')
+            print(f'               x1={cfg["roi_x1"]:.3f} x2={cfg["roi_x2"]:.3f}')
             break
-        elif k == ord('r'): pts.clear()
-        elif k == ord('q'): break
+        elif k == ord('r'):
+            pts.clear()
+            print('  Reset.')
+        elif k == ord('q'):
+            break
+
     cv2.destroyAllWindows()
 
 
@@ -1037,7 +1127,6 @@ class Detector:
                 if self.roi is None:
                     h,w = frame.shape[:2]
                     self.roi = ROI(w,h)
-                    print(f"  ROI: y={self.roi.y}  x={self.roi.x1}..{self.roi.x2}")
 
                 # Deteksi inline — simple dan reliable
                 if self._fn % CFG['process_every'] == 0:
@@ -1052,11 +1141,12 @@ class Detector:
                 # Push frame ter-anotasi ke buffer SEBELUM crossing check
                 self.buf.push(annotated)
 
-                # Cek crossing MASUK (atas→bawah)
+                # Cek crossing MASUK (kendaraan masuk ROI Box dari atas)
                 for det in tracked:
                     x1,y1,x2,y2,cls,conf,tid,prev_y2 = det
+                    cx = (x1 + x2) // 2   # titik tengah horizontal bbox
                     if (not self.tracker.has_crossed(tid) and
-                            self.roi.crossed_downward(prev_y2, y2)):
+                            self.roi.crossed_downward(prev_y2, y2, cx)):
                         self._on_cross(annotated, frame, det)
 
                 # Feed frame ter-anotasi ke writer aktif
