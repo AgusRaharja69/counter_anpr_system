@@ -127,6 +127,9 @@ def load_config(path='config.ini'):
         'tracker_iou'     : getfloat('TRACKER', 'IOU',             fallback=0.45),
         'tracker_max_age' : getint('TRACKER',   'MaxAge',          fallback=25),
         'cooldown_s'      : getfloat('TRACKER', 'CooldownSeconds', fallback=8.0),
+
+        # DISPLAY
+        'display_width'   : getint('CAMERA', 'DisplayWidth', fallback=1280),
     }
 
     # Resolve model path relatif ke BASE_DIR
@@ -322,8 +325,16 @@ class SFTPUploader:
                 print('  upload: rsync tersedia')
                 return True
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
-            pass   # rsync tidak ada (normal di Windows)
+            pass
         return False
+
+    def _has_sshpass(self):
+        try:
+            r = subprocess.run(['sshpass','-V'],
+                               capture_output=True, timeout=3)
+            return r.returncode == 0
+        except (FileNotFoundError, OSError):
+            return False
 
     def _remote_dir(self, sub):
         """Path folder tujuan di VPS."""
@@ -425,34 +436,54 @@ class SFTPUploader:
         except Exception as e:
             print(f'  rsync {sub}: exception {e}')
 
-    def _upload_all(self):
+    def _upload_all(self, label='auto'):
         if not CFG['vps_host']:
-            return   # tidak dikonfigurasi
+            return
         pairs = [
             (CFG['local_clips'],  'clips'),
             (CFG['local_thumbs'], 'thumbnails'),
             (CFG['local_events'], 'events'),
         ]
+        # Hitung total file
+        total_files = sum(
+            len([f for f in Path(local).glob('*') if f.is_file()])
+            for local, _ in pairs if os.path.isdir(local))
+
+        ts = datetime.now().strftime('%H:%M:%S')
+        if total_files == 0:
+            print(f'  [{ts}] Upload ({label}): tidak ada file baru')
+            return
+
+        print(f'  [{ts}] Upload ({label}): {total_files} file → {CFG["vps_host"]}')
+
         for local, sub in pairs:
             if not os.path.isdir(local): continue
-            # Prioritas: rsync → paramiko SFTP
-            if self._has_rsync:
+            n = len([f for f in Path(local).glob('*') if f.is_file()])
+            if n == 0: continue
+            if self._has_paramiko and CFG['vps_pass']:
+                self._sftp_upload_dir(local, sub)
+            elif self._has_rsync and CFG['rsync_use_key']:
+                self._rsync_upload_dir(local, sub)
+            elif self._has_rsync and self._has_sshpass():
                 self._rsync_upload_dir(local, sub)
             elif self._has_paramiko:
                 self._sftp_upload_dir(local, sub)
             else:
-                print(f'  [WARN] Tidak ada cara upload ({sub}). '
-                      f'Install paramiko atau rsync.')
+                print(f'  [WARN] Tidak ada cara upload. Install: pip install paramiko')
                 break
 
     def _loop(self):
+        next_up = time.time() + CFG['upload_every_s']
         while True:
-            time.sleep(CFG['upload_every_s'])
-            self._upload_all()
+            now = time.time()
+            if now >= next_up:
+                self._upload_all(label='tiap 2mnt')
+                next_up = time.time() + CFG['upload_every_s']
+            time.sleep(5)
 
     def upload_now(self):
-        """Upload segera secara blocking (tunggu selesai)."""
-        self._upload_all()
+        # Upload segera secara blocking
+        self._upload_all(label='manual')
 
 
 # ─── MQTT ─────────────────────────────────────────────────────────────────────
@@ -461,14 +492,20 @@ class MQTTClient:
         self._ok = False
         try:
             import paho.mqtt.client as mqtt
-            # Fix DeprecationWarning paho-mqtt >= 2.0
+            # paho-mqtt >= 2.0: gunakan VERSION2 untuk hilangkan DeprecationWarning
             try:
                 self.c = mqtt.Client(
-                    mqtt.CallbackAPIVersion.VERSION1,
+                    mqtt.CallbackAPIVersion.VERSION2,
                     client_id=f"rpi-{CFG['device_id']}-{int(time.time())}")
+                # VERSION2: callback on_connect(c,u,f,rc,props), on_disconnect(c,u,disc,props)
+                self.c.on_connect    = lambda c,u,f,rc,p: self._conn(rc)
+                self.c.on_disconnect = lambda c,u,d,p: print(f'  MQTT disc rc={d.rc if hasattr(d,"rc") else d}')
             except AttributeError:
+                # paho-mqtt < 2.0
                 self.c = mqtt.Client(
                     client_id=f"rpi-{CFG['device_id']}-{int(time.time())}")
+                self.c.on_connect    = lambda c,u,f,rc: self._conn(rc)
+                self.c.on_disconnect = lambda c,u,rc: print(f'  MQTT disc rc={rc}')
 
             if CFG['mqtt_user']:
                 self.c.username_pw_set(CFG['mqtt_user'], CFG['mqtt_pass'])
@@ -476,8 +513,6 @@ class MQTTClient:
                 self._t('status'),
                 json.dumps({'device_id':CFG['device_id'],'online':False,'status':0}),
                 qos=1, retain=True)
-            self.c.on_connect    = lambda c,u,f,rc: self._conn(rc)
-            self.c.on_disconnect = lambda c,u,rc: print(f'  MQTT disc rc={rc}')
             self.c.connect_async(CFG['mqtt_broker'], CFG['mqtt_port'], 60)
             self.c.loop_start()
             self._ok = True
@@ -604,6 +639,23 @@ class Detector:
         print(f'  Folder lokal: {Path(CFG["local_clips"]).parent}')
 
         print('Loading YOLOv8n...')
+        # Fix torch >= 2.6: weights_only default berubah jadi True
+        # patch agar YOLO model (.pt) bisa di-load tanpa error
+        try:
+            import torch
+            if hasattr(torch.serialization, 'add_safe_globals'):
+                try:
+                    from ultralytics.nn.tasks import (
+                        DetectionModel, SegmentationModel,
+                        ClassificationModel, PoseModel)
+                    torch.serialization.add_safe_globals([
+                        DetectionModel, SegmentationModel,
+                        ClassificationModel, PoseModel])
+                except ImportError:
+                    pass
+        except Exception:
+            pass
+
         from ultralytics import YOLO
         self.vm = YOLO(CFG['vehicle_model'])
         self.pm = None
@@ -614,7 +666,24 @@ class Detector:
     # ── Buka sumber video ──────────────────────────────────────────────────────
     def _open(self):
         if self.source == 'rtsp':
-            cap = cv2.VideoCapture(CFG['rtsp_url'])
+            # Paksa TCP + no-buffer SEBELUM buka capture
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
+                'rtsp_transport;tcp|'
+                'fflags;nobuffer|'
+                'flags;low_delay|'
+                'allowed_media_types;video')
+            cap = cv2.VideoCapture(CFG['rtsp_url'], cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            # Turunkan resolusi baca jika kamera 4K/2K (hemat CPU RPi)
+            # cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+            # cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            if not cap.isOpened():
+                print('  [WARN] Gagal buka RTSP')
+            else:
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                print(f'  RTSP OK: {w}x{h}')
+            return cap
         elif self.source == 'folder':
             fp = Path(self.fp) if os.path.isabs(self.fp) else BASE_DIR / self.fp
             files = sorted(fp.glob('*.mp4')) + sorted(fp.glob('*.avi'))
@@ -624,11 +693,12 @@ class Detector:
             return self._nf()
         elif self.source == 'webcam':
             cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            return cap
         else:
             fp = Path(self.fp) if os.path.isabs(self.fp) else BASE_DIR / self.fp
             cap = cv2.VideoCapture(str(fp))
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-        return cap
+            return cap
 
     def _nf(self):
         p = next(self._fi)
@@ -808,6 +878,13 @@ class Detector:
         cap = self._open()
         self.buf = ClipBuffer(CFG['clip_fps'])
 
+        # Buat window SEKALI, nama tetap sepanjang sesi
+        self._win_name = f"ANPR [{CFG['device_id']}]"
+        cv2.namedWindow(self._win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self._win_name,
+                         CFG.get('display_width', 1280),
+                         CFG.get('display_width', 1280) * 9 // 16)
+
         # Heartbeat tiap 30 detik
         def hb():
             while True:
@@ -824,24 +901,73 @@ class Detector:
 
         print(f"\nDetector running [{CFG['device_id']}]. Tekan Q untuk berhenti.\n")
 
+        # Thread khusus baca RTSP agar main loop tidak nunggu network
+        self._rtsp_frame  = None
+        self._rtsp_ret    = False
+        self._rtsp_lock   = threading.Lock()
+        self._rtsp_stop   = False
+
+        def rtsp_reader():
+            nonlocal cap
+            consec_fail = 0
+            while not self._rtsp_stop:
+                if self.source == 'rtsp':
+                    # grab() lebih cepat dari read() — tidak decode dulu
+                    ok = cap.grab()
+                    if not ok:
+                        consec_fail += 1
+                        if consec_fail >= 30:
+                            print(f"  RTSP putus, reconnect dalam {CFG['reconnect_s']}s...")
+                            cap.release()
+                            time.sleep(CFG['reconnect_s'])
+                            cap = self._open()
+                            consec_fail = 0
+                        continue
+                    consec_fail = 0
+                    # retrieve() untuk decode frame yang sudah di-grab
+                    ret, frame = cap.retrieve()
+                    with self._rtsp_lock:
+                        self._rtsp_frame = frame if ret else None
+                        self._rtsp_ret   = ret
+                else:
+                    ret, frame = cap.read()
+                    with self._rtsp_lock:
+                        self._rtsp_frame = frame if ret else None
+                        self._rtsp_ret   = ret
+
+        if self.source == 'rtsp':
+            threading.Thread(target=rtsp_reader, daemon=True).start()
+            time.sleep(1)  # tunggu frame pertama
+
+        _no_frame_count = 0
+
         try:
             while True:
-                ret, frame = cap.read()
-                if not ret:
-                    if self.source == 'folder':
-                        try:
-                            cap.release(); cap = self._nf(); continue
-                        except StopIteration:
-                            print('  Semua video selesai.')
-                            break
-                    elif self.source == 'rtsp':
-                        print(f"  RTSP putus, reconnect dalam {CFG['reconnect_s']}s...")
-                        cap.release()
-                        time.sleep(CFG['reconnect_s'])
-                        cap = self._open()
+                # Ambil frame
+                if self.source == 'rtsp':
+                    with self._rtsp_lock:
+                        ret   = self._rtsp_ret
+                        frame = self._rtsp_frame
+                    if not ret or frame is None:
+                        _no_frame_count += 1
+                        if _no_frame_count > 100:
+                            print('  Tidak ada frame dari RTSP, tunggu...')
+                            _no_frame_count = 0
+                        time.sleep(0.01)
                         continue
-                    else:
-                        break
+                    _no_frame_count = 0
+                    frame = frame.copy()  # copy agar tidak di-overwrite thread
+                else:
+                    ret, frame = cap.read()
+                    if not ret:
+                        if self.source == 'folder':
+                            try:
+                                cap.release(); cap = self._nf(); continue
+                            except StopIteration:
+                                print('  Semua video selesai.')
+                                break
+                        else:
+                            break
 
                 self._fn += 1
 
@@ -871,15 +997,28 @@ class Detector:
                 # Feed frame ter-anotasi ke writer aktif
                 self.buf.feed(annotated)
 
-                # Tampilkan
-                cv2.imshow(f"ANPR [{CFG['device_id']}]  Masuk: {self.cnt['total']}",
-                           annotated)
+                # Tampilkan — resize agar tidak terlalu besar di layar
+                disp = annotated
+                dh, dw = disp.shape[:2]
+                max_w = CFG.get('display_width', 1280)
+                if dw > max_w:
+                    scale = max_w / dw
+                    disp  = cv2.resize(disp, (max_w, int(dh*scale)))
+                # Nama window TETAP (tidak berubah tiap frame)
+                # sehingga tidak menumpuk saat counter bertambah
+                cv2.imshow(self._win_name, disp)
+                # Update title bar dengan counter terbaru
+                cv2.setWindowTitle(
+                    self._win_name,
+                    f"ANPR [{CFG['device_id']}]  Masuk: {self.cnt['total']}")
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
         except KeyboardInterrupt:
             print('\nDihentikan.')
         finally:
+            self._rtsp_stop = True   # hentikan thread RTSP reader
+            time.sleep(0.3)
             cap.release()
             cv2.destroyAllWindows()
             self.mqtt.pub('status', {
