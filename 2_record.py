@@ -74,69 +74,98 @@ def cleanup_old(videos_dir, keep):
 # ─── RECORD ONE SEGMENT ───────────────────────────────────────────────────────
 def record_segment(videos_dir, duration, rtsp_url):
     """
-    Rekam satu segment via ffmpeg.
-    Return: path file yang baru selesai, atau None jika gagal.
+    Rekam satu segment via ffmpeg menggunakan dua tahap:
+    1. Rekam ke format .ts (MPEG-TS) — tidak butuh rewrite header, selalu berhasil
+    2. Remux .ts ke .mp4 tanpa re-encode — cepat, < 1 detik
+    Strategi ini menghindari error "Unable to re-open" pada mp4 langsung.
     """
     Path(videos_dir).mkdir(parents=True, exist_ok=True)
-    ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-    filename = f'rec_{ts}.mp4'
-    filepath = str(Path(videos_dir) / filename)
+    ts_str   = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts_file  = str(Path(videos_dir) / f'tmp_{ts_str}.ts')   # intermediate
+    mp4_file = str(Path(videos_dir) / f'rec_{ts_str}.mp4')  # output akhir
 
-    fps = CFG.get('record_fps', 10)
-
-    # Jika fps < fps kamera asli: re-encode dengan fps rendah
-    # Manfaat: file lebih kecil + 1_detect.py proses lebih sedikit frame
-    # tapi setiap frame tetap resolusi penuh (tidak ada informasi hilang)
-    if fps > 0:
-        video_opts = [
-            '-vf',   f'fps={fps}',       # throttle ke N fps
-            '-c:v',  'libx264',          # re-encode (perlu karena ubah fps)
-            '-preset', 'ultrafast',      # encode secepat mungkin
-            '-crf',  '28',               # kualitas: 18=tinggi, 28=cukup
-        ]
-    else:
-        # fps=0: copy stream langsung tanpa re-encode (paling cepat)
-        video_opts = ['-c:v', 'copy']
-
-    cmd = [
+    # ── Tahap 1: Rekam ke .ts (stream copy, tidak ada rewrite header) ──
+    cmd_rec = [
         'ffmpeg',
-        '-loglevel',       'error',
+        '-loglevel',       'warning',      # tampilkan warning untuk debug
         '-rtsp_transport', 'tcp',
         '-fflags',         'nobuffer',
         '-flags',          'low_delay',
         '-i',              rtsp_url,
         '-t',              str(duration),
-        *video_opts,
+        '-c:v',            'copy',
         '-an',
-        # HAPUS +faststart — penyebab error "Unable to re-open"
-        # faststart perlu rewrite header setelah selesai, sering gagal di RPi
+        '-f',              'mpegts',       # format TS tidak butuh rewrite
         '-y',
-        filepath,
+        ts_file,
     ]
 
-    print(f'  [rec] START {filename}  ({duration}s)')
+    log_file = str(Path(videos_dir) / f'rec_{ts_str}.log')
+    print(f'  [rec] START rec_{ts_str}.mp4  ({duration}s)')
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=duration + 30)
+        # Tulis stderr ke file log agar tidak buffer-blocking
+        with open(log_file, 'w') as lf:
+            r1 = subprocess.run(cmd_rec,
+                                stdout=subprocess.DEVNULL,
+                                stderr=lf,
+                                timeout=duration + 30)
 
-        if result.returncode == 0 and Path(filepath).exists():
-            size_mb = Path(filepath).stat().st_size / 1024 / 1024
-            print(f'  [rec] DONE  {filename}  ({size_mb:.1f} MB)')
-            return filepath
-        else:
-            err = result.stderr.decode(errors='replace')[:200]
-            print(f'  [rec] FAIL  {filename}  → {err}')
-            # Hapus file rusak jika ada
-            try: Path(filepath).unlink()
+        # Baca log untuk cek error
+        log_content = ''
+        try:
+            log_content = open(log_file).read()
+        except: pass
+
+        # Cek hasil rekam
+        if not Path(ts_file).exists() or Path(ts_file).stat().st_size < 1024:
+            lines = [l for l in log_content.strip().splitlines() if l.strip()]
+            for l in lines[-4:]:
+                print(f'  [rec] ERR: {l}')
+            try: Path(log_file).unlink()
             except: pass
             return None
 
-    except subprocess.TimeoutExpired:
-        print(f'  [rec] TIMEOUT {filename}')
-        try: Path(filepath).unlink()
+        size_ts = Path(ts_file).stat().st_size / 1024 / 1024
+
+        # ── Tahap 2: Remux .ts → .mp4 (sangat cepat, tidak re-encode) ──
+        cmd_mux = [
+            'ffmpeg',
+            '-loglevel', 'error',
+            '-i',        ts_file,
+            '-c',        'copy',
+            '-y',
+            mp4_file,
+        ]
+        r2 = subprocess.run(cmd_mux,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            timeout=30)
+
+        # Hapus file .ts sementara
+        try: Path(ts_file).unlink()
         except: pass
+
+        # Hapus log setelah selesai
+        try: Path(log_file).unlink()
+        except: pass
+
+        if r2.returncode == 0 and Path(mp4_file).exists():
+            size_mp4 = Path(mp4_file).stat().st_size / 1024 / 1024
+            print(f'  [rec] DONE  rec_{ts_str}.mp4  ({size_mp4:.1f} MB)')
+            return mp4_file
+        else:
+            err = r2.stderr.decode(errors='replace').strip() if r2.stderr else ''
+            print(f'  [rec] REMUX FAIL: {err[:150]}')
+            # Fallback: rename .ts → .mp4 agar 1_detect.py tetap bisa baca
+            if Path(ts_file).exists():
+                Path(ts_file).rename(mp4_file)
+            return mp4_file if Path(mp4_file).exists() else None
+
+    except subprocess.TimeoutExpired:
+        print(f'  [rec] TIMEOUT rec_{ts_str}.mp4')
+        for f in [ts_file, mp4_file]:
+            try: Path(f).unlink()
+            except: pass
         return None
     except FileNotFoundError:
         print('[ERROR] ffmpeg tidak ditemukan. Install: sudo apt install ffmpeg')
