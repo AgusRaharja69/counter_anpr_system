@@ -108,7 +108,8 @@ def record_segment(videos_dir, duration, rtsp_url):
         '-t',              str(duration),
         *video_opts,
         '-an',
-        '-movflags', '+faststart',
+        # HAPUS +faststart — penyebab error "Unable to re-open"
+        # faststart perlu rewrite header setelah selesai, sering gagal di RPi
         '-y',
         filepath,
     ]
