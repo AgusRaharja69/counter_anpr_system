@@ -910,29 +910,6 @@ class Detector:
                          CFG.get('display_width', 1280),
                          CFG.get('display_width', 1280) * 9 // 16)
 
-        # Thread deteksi terpisah (non-blocking inference)
-        self._det_result = []
-        self._det_lock   = threading.Lock()
-        self._det_event  = threading.Event()
-        self._det_busy   = False
-        self._det_frame  = None
-        self._det_stop   = False
-
-        def detect_worker():
-            while not self._det_stop:
-                self._det_event.wait(timeout=1)
-                self._det_event.clear()
-                if self._det_frame is None: continue
-                result = self._detect_v(self._det_frame)
-                with self._det_lock:
-                    self._det_result = result
-                self._det_busy = False
-
-        if CFG.get('detect_thread', True):
-            threading.Thread(target=detect_worker, daemon=True).start()
-            print('  Mode: detect thread (non-blocking)')
-        else:
-            print('  Mode: detect inline (blocking)')
 
         # Heartbeat tiap 30 detik
         def hb():
@@ -1026,22 +1003,11 @@ class Detector:
                     self.roi = ROI(w,h)
                     print(f"  ROI: y={self.roi.y}  x={self.roi.x1}..{self.roi.x2}")
 
-                # Deteksi di thread terpisah jika DetectThread=True
-                # sehingga main loop tidak blocking saat inferensi
+                # Deteksi inline — simple dan reliable
                 if self._fn % CFG['process_every'] == 0:
-                    if CFG.get('detect_thread', True):
-                        with self._det_lock:
-                            dets = list(self._det_result)
-                        # kirim frame ke thread deteksi
-                        if not self._det_busy:
-                            self._det_busy = True
-                            self._det_frame = frame.copy()
-                            self._det_event.set()
-                    else:
-                        dets = self._detect_v(frame)
+                    dets = self._detect_v(frame)
                 else:
-                    with self._det_lock:
-                        dets = list(self._det_result)
+                    dets = []
                 tracked = self.tracker.update(dets)
 
                 # Buat frame ter-anotasi
@@ -1081,7 +1047,6 @@ class Detector:
             print('\nDihentikan.')
         finally:
             self._rtsp_stop = True   # hentikan thread RTSP reader
-            self._det_stop  = True   # hentikan thread deteksi
             time.sleep(0.3)
             cap.release()
             cv2.destroyAllWindows()
