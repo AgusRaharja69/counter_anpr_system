@@ -131,6 +131,9 @@ def load_config(path='config.ini'):
         # DISPLAY
         'display_width'   : getint('CAMERA', 'DisplayWidth', fallback=1280),
 
+        # FOLDER MODE
+        'delete_after_process': getbool('RECORD', 'DeleteAfterProcess', fallback=True),
+
         # PERFORMA RPi
         'imgsz'           : getint('MODEL', 'ImgSize',      fallback=320),
         'detect_thread'   : getbool('MODEL', 'DetectThread', fallback=True),
@@ -690,12 +693,13 @@ class Detector:
                 print(f'  RTSP OK: {w}x{h}')
             return cap
         elif self.source == 'folder':
-            fp = Path(self.fp) if os.path.isabs(self.fp) else BASE_DIR / self.fp
-            files = sorted(fp.glob('*.mp4')) + sorted(fp.glob('*.avi'))
-            if not files:
-                print(f'  [WARN] Tidak ada video di: {fp}')
-            self._fi = iter(files)
-            return self._nf()
+            self._folder_path = Path(self.fp) if os.path.isabs(self.fp) \
+                                else BASE_DIR / self.fp
+            self._folder_path.mkdir(parents=True, exist_ok=True)
+            self._processed   = set()   # file yang sudah diproses
+            self._current_file = None
+            self._fi = iter([])         # kosong dulu, diisi _nf_folder()
+            return self._nf_folder()
         elif self.source == 'webcam':
             cap = cv2.VideoCapture(0)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -709,6 +713,28 @@ class Detector:
         p = next(self._fi)
         print(f'  Playing: {p}')
         return cv2.VideoCapture(str(p))
+
+    def _nf_folder(self):
+        """Ambil file berikutnya dari folder.
+        Jika tidak ada, tunggu hingga ada file baru (dari record.py).
+        File yang sudah diproses diabaikan.
+        """
+        while True:
+            # Scan ulang folder untuk file yang belum diproses
+            all_files = sorted(
+                list(self._folder_path.glob('*.mp4')) +
+                list(self._folder_path.glob('*.avi')),
+                key=lambda f: f.stat().st_mtime)  # urut dari terlama
+            pending = [f for f in all_files
+                       if str(f) not in self._processed]
+            if pending:
+                p = pending[0]
+                self._current_file = p
+                print(f'  [detect] Processing: {p.name}')
+                return cv2.VideoCapture(str(p))
+            # Tidak ada file baru — tunggu sebentar
+            print(f'  [detect] Menunggu file baru di {self._folder_path}...')
+            time.sleep(3)
 
     # ── Deteksi YOLO ────────────────────────────────────────────
     def _detect_v(self, frame):
@@ -987,11 +1013,21 @@ class Detector:
                     ret, frame = cap.read()
                     if not ret:
                         if self.source == 'folder':
-                            try:
-                                cap.release(); cap = self._nf(); continue
-                            except StopIteration:
-                                print('  Semua video selesai.')
-                                break
+                            cap.release()
+                            # Tandai file ini sudah selesai diproses
+                            if self._current_file:
+                                self._processed.add(str(self._current_file))
+                                if CFG.get('delete_after_process', True):
+                                    try:
+                                        self._current_file.unlink()
+                                        print(f'  [detect] Hapus: '
+                                              f'{self._current_file.name}')
+                                    except Exception as e:
+                                        print(f'  [detect] Gagal hapus: {e}')
+                                self._current_file = None
+                            # Cari file berikutnya, tunggu jika belum ada
+                            cap = self._nf_folder()
+                            continue
                         else:
                             break
 
