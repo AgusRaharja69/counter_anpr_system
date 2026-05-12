@@ -130,6 +130,11 @@ def load_config(path='config.ini'):
 
         # DISPLAY
         'display_width'   : getint('CAMERA', 'DisplayWidth', fallback=1280),
+
+        # PERFORMA RPi
+        'imgsz'           : getint('MODEL', 'ImgSize',      fallback=320),
+        'detect_thread'   : getbool('MODEL', 'DetectThread', fallback=True),
+        'resize_before_detect': getint('MODEL', 'ResizeBeforeDetect', fallback=640),
     }
 
     # Resolve model path relatif ke BASE_DIR
@@ -705,15 +710,35 @@ class Detector:
         print(f'  Playing: {p}')
         return cv2.VideoCapture(str(p))
 
-    # ── Deteksi YOLO ──────────────────────────────────────────────────────────
+    # ── Deteksi YOLO ────────────────────────────────────────────
     def _detect_v(self, frame):
-        res = self.vm(frame, conf=CFG['vehicle_conf'],
-                      classes=CFG['vehicle_classes'], verbose=False)
+        # Resize frame sebelum YOLO (hemat CPU signifikan di RPi)
+        h, w  = frame.shape[:2]
+        rbd   = CFG.get('resize_before_detect', 640)
+        if rbd and w > rbd:
+            scale = rbd / w
+            small = cv2.resize(frame, (rbd, int(h * scale)),
+                               interpolation=cv2.INTER_LINEAR)
+            sx, sy = w / rbd, h / int(h * scale)
+        else:
+            small  = frame
+            sx, sy = 1.0, 1.0
+
+        res = self.vm(
+            small,
+            imgsz   = CFG.get('imgsz', 320),
+            conf    = CFG['vehicle_conf'],
+            classes = CFG['vehicle_classes'],
+            verbose = False,
+        )
         out = []
         for r in res:
             for b in r.boxes:
-                x1,y1,x2,y2 = b.xyxy[0].cpu().numpy().astype(int)
-                out.append((x1,y1,x2,y2,int(b.cls[0]),float(b.conf[0])))
+                x1, y1, x2, y2 = b.xyxy[0].cpu().numpy()
+                # Scale bbox kembali ke koordinat frame asli
+                out.append((
+                    int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy),
+                    int(b.cls[0]), float(b.conf[0])))
         return out
 
     def _detect_plate(self, vcrop):
@@ -885,6 +910,30 @@ class Detector:
                          CFG.get('display_width', 1280),
                          CFG.get('display_width', 1280) * 9 // 16)
 
+        # Thread deteksi terpisah (non-blocking inference)
+        self._det_result = []
+        self._det_lock   = threading.Lock()
+        self._det_event  = threading.Event()
+        self._det_busy   = False
+        self._det_frame  = None
+        self._det_stop   = False
+
+        def detect_worker():
+            while not self._det_stop:
+                self._det_event.wait(timeout=1)
+                self._det_event.clear()
+                if self._det_frame is None: continue
+                result = self._detect_v(self._det_frame)
+                with self._det_lock:
+                    self._det_result = result
+                self._det_busy = False
+
+        if CFG.get('detect_thread', True):
+            threading.Thread(target=detect_worker, daemon=True).start()
+            print('  Mode: detect thread (non-blocking)')
+        else:
+            print('  Mode: detect inline (blocking)')
+
         # Heartbeat tiap 30 detik
         def hb():
             while True:
@@ -977,9 +1026,23 @@ class Detector:
                     self.roi = ROI(w,h)
                     print(f"  ROI: y={self.roi.y}  x={self.roi.x1}..{self.roi.x2}")
 
-                # Deteksi & track
-                dets    = self._detect_v(frame) if self._fn % CFG['process_every'] == 0 else []
-                tracked = self.tracker.update(dets) if dets else self.tracker.update([])
+                # Deteksi di thread terpisah jika DetectThread=True
+                # sehingga main loop tidak blocking saat inferensi
+                if self._fn % CFG['process_every'] == 0:
+                    if CFG.get('detect_thread', True):
+                        with self._det_lock:
+                            dets = list(self._det_result)
+                        # kirim frame ke thread deteksi
+                        if not self._det_busy:
+                            self._det_busy = True
+                            self._det_frame = frame.copy()
+                            self._det_event.set()
+                    else:
+                        dets = self._detect_v(frame)
+                else:
+                    with self._det_lock:
+                        dets = list(self._det_result)
+                tracked = self.tracker.update(dets)
 
                 # Buat frame ter-anotasi
                 annotated = self._annotate(frame.copy(), tracked)
@@ -1018,6 +1081,7 @@ class Detector:
             print('\nDihentikan.')
         finally:
             self._rtsp_stop = True   # hentikan thread RTSP reader
+            self._det_stop  = True   # hentikan thread deteksi
             time.sleep(0.3)
             cap.release()
             cv2.destroyAllWindows()
