@@ -938,19 +938,58 @@ if __name__ == '__main__':
     print('=' * 60)
 
     if args.setup_roi:
-        src = CFG['rtsp_url'] if CFG['source'] == 'rtsp' else (CFG['file_path'] or 0)
-        if not os.path.isabs(str(src)) and src not in (0, ''):
-            src = str(BASE_DIR / src)
-        cap = cv2.VideoCapture(src if src != 0 else 0)
+        # Tentukan sumber video untuk setup ROI
+        if CFG['source'] == 'rtsp' and CFG['rtsp_url']:
+            src = CFG['rtsp_url']
+            src_label = f"RTSP: {CFG['rtsp_url']}"
+        elif CFG['source'] == 'folder' and CFG['file_path']:
+            # Ambil video pertama dari folder
+            fp = Path(CFG['file_path']) if os.path.isabs(CFG['file_path'])                  else BASE_DIR / CFG['file_path']
+            videos = sorted(fp.glob('*.mp4')) + sorted(fp.glob('*.avi'))
+            if not videos:
+                print(f'Tidak ada video di folder: {fp}')
+                raise SystemExit(1)
+            src = str(videos[0])
+            src_label = f"File: {src}"
+        elif CFG['source'] in ('video','webcam') and CFG['file_path']:
+            src = CFG['file_path'] if os.path.isabs(CFG['file_path'])                   else str(BASE_DIR / CFG['file_path'])
+            src_label = f"File: {src}"
+        elif CFG['source'] == 'webcam':
+            src = 0
+            src_label = "Webcam"
+        else:
+            print(f"[ERROR] Sumber video tidak diketahui atau RTSP URL kosong.")
+            print(f"  Gunakan salah satu:")
+            print(f"  python 1_detect.py --setup-roi --source rtsp")
+            print(f"  python 1_detect.py --setup-roi --source folder --file videos/")
+            print(f"  python 1_detect.py --setup-roi --source video --file test.mp4")
+            print(f"  python 1_detect.py --setup-roi --source webcam")
+            raise SystemExit(1)
+
+        print(f"  Setup ROI dari: {src_label}")
+
+        # Buka video dan ambil frame
+        cap = cv2.VideoCapture(src if isinstance(src, int) else str(src))
         frm = None
-        for _ in range(10):
+
+        # Untuk RTSP: coba lebih banyak frame karena butuh koneksi
+        max_try = 30 if CFG['source'] == 'rtsp' else 10
+        for i in range(max_try):
             ret, frm = cap.read()
-            if ret: break
+            if ret:
+                break
+            time.sleep(0.1)
+
         cap.release()
+
         if frm is not None:
+            print(f"  Frame berhasil diambil ({frm.shape[1]}x{frm.shape[0]})")
             setup_roi(frm)
         else:
-            print('Gagal buka sumber video untuk setup ROI.')
+            print(f"[ERROR] Gagal buka sumber video: {src_label}")
+            if CFG['source'] == 'rtsp':
+                print(f"  Cek: apakah kamera {CFG['rtsp_url']} bisa diakses?")
+                print(f"  Test: ffprobe {CFG['rtsp_url']}")
     else:
         Detector(
             source    = CFG['source'],
